@@ -1,8 +1,10 @@
 #include "util/https_download.h"
 #include "util/extract_tar_gz.h"
 #include <nlohmann/json.hpp>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
+#include <iterator>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -115,6 +117,24 @@ static std::string pick_channel_url(const json &index, int pinnedMajor = -1) {
 }
 
 // -------------------------------------------------------------------
+// Find the releases.json URL for a given major channel (e.g. 8 -> 8.0)
+// -------------------------------------------------------------------
+static std::string find_channel_url_by_major(const json &index, int major) {
+    for (auto &entry : index["releases-index"]) {
+        std::string chanVer = entry.value("channel-version", "");
+        std::string url = entry.value("releases.json", "");
+        if (url.empty())
+            continue;
+        try {
+            if (std::stoi(chanVer.substr(0, chanVer.find('.'))) == major)
+                return url;
+        } catch (...) {
+        }
+    }
+    return {};
+}
+
+// -------------------------------------------------------------------
 // Pick Hosting Bundle runtime asset (default) or SDK
 // -------------------------------------------------------------------
 static std::string pick_asset_url(const json &channel,
@@ -160,6 +180,118 @@ static std::string pick_asset_url(const json &channel,
 }
 
 // -------------------------------------------------------------------
+// TFM detection: figure out which .NET major the project targets so we
+// install an SDK whose bundled runtime can actually run the app.
+// Signals, in order: *.runtimeconfig.json (the exact runtime an app was
+// built for), then *.csproj <TargetFramework(s)>.
+// -------------------------------------------------------------------
+static int runtimeconfig_major(const fs::path &rcFile) {
+    try {
+        std::ifstream fin(rcFile);
+        json rc;
+        fin >> rc;
+        const auto &ro = rc.at("runtimeOptions");
+
+        std::string version;
+        if (ro.contains("framework") && ro["framework"].contains("version")) {
+            version = ro["framework"]["version"].get<std::string>();
+        } else if (ro.contains("frameworks") && ro["frameworks"].is_array()) {
+            // ASP.NET Core apps list frameworks as an array; prefer the base one.
+            for (auto &fw : ro["frameworks"]) {
+                std::string name = fw.value("name", "");
+                if (name == "Microsoft.NETCore.App") {
+                    version = fw.value("version", "");
+                    break;
+                }
+            }
+            if (version.empty()) {
+                for (auto &fw : ro["frameworks"]) {
+                    std::string v = fw.value("version", "");
+                    if (!v.empty()) {
+                        version = v;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (version.find('.') != std::string::npos) {
+            int major = std::stoi(version.substr(0, version.find('.')));
+            if (major > 0)
+                return major;
+        }
+    } catch (...) {
+    }
+    return -1;
+}
+
+static int csproj_target_major(const fs::path &csproj) {
+    try {
+        std::ifstream fin(csproj);
+        std::string content((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
+
+        int best = -1;
+        size_t pos = 0;
+        while ((pos = content.find("<TargetFramework", pos)) != std::string::npos) {
+            size_t valStart = content.find('>', pos);
+            if (valStart == std::string::npos)
+                break;
+            size_t valEnd = content.find("</", valStart);
+            if (valEnd == std::string::npos)
+                break;
+            std::string value = content.substr(valStart + 1, valEnd - valStart - 1);
+
+            // value looks like "net8.0" or "net8.0;net10.0" (multi-target)
+            size_t tfmPos = 0;
+            while ((tfmPos = value.find("net", tfmPos)) != std::string::npos) {
+                size_t j = tfmPos + 3;
+                if (j < value.size() && isdigit((unsigned char)value[j])) {
+                    std::string num;
+                    while (j < value.size() && isdigit((unsigned char)value[j]))
+                        num += value[j++];
+                    int major = std::atoi(num.c_str());
+                    if (major > best)
+                        best = major;
+                }
+                tfmPos += 3;
+            }
+            pos = valEnd + 2;
+        }
+        return best;
+    } catch (...) {
+        return -1;
+    }
+}
+
+static int detect_target_major(const fs::path &dir) {
+    try {
+        // 1) runtimeconfig.json — what the app actually needs (run case)
+        for (auto &entry : fs::directory_iterator(dir)) {
+            std::string name = entry.path().filename().string();
+            if (entry.path().extension() == ".json" && name.find("runtimeconfig") != std::string::npos) {
+                int major = runtimeconfig_major(entry.path());
+                if (major != -1) {
+                    log("Detected target major " + std::to_string(major) + " from " + name);
+                    return major;
+                }
+            }
+        }
+        // 2) csproj TargetFramework(s) (build case)
+        for (auto &entry : fs::directory_iterator(dir)) {
+            if (entry.path().extension() == ".csproj") {
+                int major = csproj_target_major(entry.path());
+                if (major != -1) {
+                    log("Detected target major " + std::to_string(major) + " from " + entry.path().filename().string());
+                    return major;
+                }
+            }
+        }
+    } catch (...) {
+    }
+    return -1;
+}
+
+// -------------------------------------------------------------------
 // Main
 // -------------------------------------------------------------------
 int main(int argc, char *argv[]) {
@@ -201,22 +333,7 @@ int main(int argc, char *argv[]) {
             std::string majorStr = pinnedVersion.substr(0, pinnedVersion.find('.'));
             int pinnedMajor = std::stoi(majorStr);
 
-            std::string pinnedChannelUrl;
-            for (auto &entry : index["releases-index"]) {
-                std::string chanVer = entry.value("channel-version", "");
-                std::string url = entry.value("releases.json", "");
-                if (url.empty())
-                    continue;
-
-                try {
-                    int major = std::stoi(chanVer.substr(0, chanVer.find('.')));
-                    if (major == pinnedMajor) {
-                        pinnedChannelUrl = url;
-                        break;
-                    }
-                } catch (...) {
-                }
-            }
+            std::string pinnedChannelUrl = find_channel_url_by_major(index, pinnedMajor);
 
             if (pinnedChannelUrl.empty()) {
                 log("No channel found for major " + majorStr);
@@ -264,26 +381,19 @@ int main(int argc, char *argv[]) {
             }
 
         std::string channelUrl;
-        if (cachedMajor != -1) {
-            // ---- Direct lookup for cachedMajor, allow STS too
-            for (auto &entry : index["releases-index"]) {
-                std::string chanVer = entry.value("channel-version", "");
-                std::string url = entry.value("releases.json", "");
-                if (url.empty()) continue;
-                try {
-                    int major = std::stoi(chanVer.substr(0, chanVer.find('.')));
-                    if (major == cachedMajor) {
-                        channelUrl = url;
-                        break;
-                    }
-                } catch (...) {}
-            }
+        int projectMajor = detect_target_major(projectRoot);
+        if (projectMajor != -1) {
+            channelUrl = find_channel_url_by_major(index, projectMajor);
             if (channelUrl.empty()) {
-                log("No channel found for pinned major " + std::to_string(cachedMajor));
-                return 1;
+                log("No channel found for detected major " + std::to_string(projectMajor) + ", falling back");
             }
-        } else {
-            // ---- First-time run, no version.txt yet → pick active LTS
+        }
+        if (channelUrl.empty() && cachedMajor != -1) {
+            // ---- Cached major (from a previous run) as a fallback
+            channelUrl = find_channel_url_by_major(index, cachedMajor);
+        }
+        if (channelUrl.empty()) {
+            // ---- First-time run / nothing detected → pick active LTS
             channelUrl = pick_channel_url(index);
             if (channelUrl.empty()) {
                 log("Could not determine channel URL");
@@ -297,12 +407,22 @@ int main(int argc, char *argv[]) {
             channelJson = json::parse(channelStr);
 
             targetVersion = channelJson.value("latest-release", "");
-            if (cachedMajor == -1) {
+            int effectiveMajor = projectMajor != -1 ? projectMajor : cachedMajor;
+            if (effectiveMajor == -1) {
+                // ---- First run chosen by active LTS → cache the channel major
                 try {
                     int latestMajor = std::stoi(channelJson.value("channel-version", "0"));
                     std::ofstream fout(versionFile);
                     fout << latestMajor;
                     log("Pinned major " + std::to_string(latestMajor) + " into version.txt");
+                } catch (...) {
+                }
+            } else if (effectiveMajor != cachedMajor) {
+                // ---- Fresh detection / changed cache → persist it
+                try {
+                    std::ofstream fout(versionFile, std::ios::trunc);
+                    fout << effectiveMajor;
+                    log("Pinned major " + std::to_string(effectiveMajor) + " into version.txt");
                 } catch (...) {
                 }
             }
