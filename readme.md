@@ -14,7 +14,7 @@ By default it uses the latest **LTS**, or you can pin to a specific version.
 ./run-dotnet 10 run Program.cs   # pin to specific version
 ```
 
-# Or use [github-exec](https://github.com/zacuke/github-exec) to run this as part of a one-liner.
+# Or use [github-exec](https://github.com/ldkeeton/github-exec) to run this as part of a one-liner.
 ```bash
-github-exec zacuke/run-dotnet ef database update
+github-exec ldkeeton/run-dotnet ef database update
 ```
